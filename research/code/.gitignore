@@ -1,0 +1,7 @@
+.venv
+__pycache__
+osv_data
+dataset*
+*.json
+*.jsonl
+*.log
