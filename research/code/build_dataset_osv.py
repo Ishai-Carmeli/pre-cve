@@ -387,14 +387,15 @@ def main():
         return
 
     skip = {s.strip().lower() for s in a.skip.split(",") if s.strip()}
+    # Goes over keys by default
     repos = sorted(r for r in fixes if r not in skip)
     random.Random(a.seed).shuffle(repos)
     repos = repos[a.offset:(a.offset + a.max_repos) if a.max_repos else None]
     done_path = a.out + ".done"
     done = set()
-    for p in (done_path,):
-        if os.path.exists(p):
-            done |= {l.strip() for l in open(p, encoding="utf-8") if l.strip()}
+    if os.path.exists(done_path):
+        with open(done_path, encoding="utf-8") as fh:
+            done = {l.strip() for l in fh if l.strip()}
     todo = [r for r in repos if r not in done]
     print(f"processing {len(todo)} repos (already done: {len(repos) - len(todo)}) with {a.threads} threads "
           f"-> {a.out}", flush=True)
