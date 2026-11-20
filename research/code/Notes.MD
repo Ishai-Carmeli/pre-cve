@@ -21,3 +21,5 @@ Commit 5525f8c is probably the same change copied to a release branch. The diff 
 Solution: commits should be group by repositries.
 
 -  It seems like data is splitted by repositories and not commits
+
+- We get atmost 12 commits out of every repository.
