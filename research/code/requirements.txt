@@ -1,5 +1,5 @@
 bandit>=1.7
-semgrep>=1.50   # optional
+# semgrep>=1.50   # optional
 packaging>=21
 scikit-learn==1.9.1   # must match the version model.joblib was trained with
 scipy
