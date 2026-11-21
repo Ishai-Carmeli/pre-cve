@@ -55,6 +55,7 @@ except ImportError as e:                                             # pragma: n
 
 from dataset_types import (DatasetRow, Evidence, EvidenceCounts, FileChange, FixInfo, FixLink, Fixes, MalStats,
                            OsvRecord, OsvStats, RepoFixes, RepoResult, RepoStats)
+from my_logger import start_logging
 
 ENV = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="true")   # never wait for a password
 MAX_FILE = 120_000          # skip files bigger than this many characters
@@ -370,7 +371,13 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=1, help="seed of the repo shuffle")
     ap.add_argument("--dump-fixes", default=None, help="also write {repo: {sha: id}} as json (old --fixes-json format)")
     ap.add_argument("--dry-run", action="store_true", help="print statistics and stop (no git, no output file)")
+    ap.add_argument("--no-log", action="store_true",
+                    help="do not copy the printed output to a log file (default: <out without .jsonl>.log, "
+                         "overwritten on every run)")
     a = ap.parse_args()
+
+    if not a.no_log:
+        start_logging(os.path.splitext(a.out)[0] + ".log")
 
     if not os.path.isdir(a.osv_dir):
         sys.exit(f"{a.osv_dir} is not a folder - run download_osv.py first")
