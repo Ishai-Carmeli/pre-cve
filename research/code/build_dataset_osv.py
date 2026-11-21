@@ -45,13 +45,16 @@ import tempfile
 import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 
 try:
     from commit_analyzer import CODE_EXT, _DOC_RE, _TEST_RE, _VENDOR_RE
 except ImportError as e:                                             # pragma: no cover
     sys.exit(f"cannot import commit_analyzer ({e}).\nPut this file in the project folder (next to "
              f"commit_analyzer.py) and run it from there; install requirements.txt first.")
+
+from dataset_types import (DatasetRow, Evidence, EvidenceCounts, FileChange, FixInfo, FixLink, Fixes, MalStats,
+                           OsvRecord, OsvStats, RepoFixes, RepoResult, RepoStats)
 
 ENV = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="true")   # never wait for a password
 MAX_FILE = 120_000          # skip files bigger than this many characters
@@ -70,18 +73,18 @@ _TRANSIENT = re.compile(r"timed out|timeout|unable to access|Connection|reset|RP
 
 
 # --------------------------------------------------------------------------- git helpers
-def sh(cwd, *args, timeout=240):
-    p = subprocess.run(["git", "-C", cwd, *args], capture_output=True, timeout=timeout, env=ENV)
+def sh(cwd: str, *args: str, timeout_sec: int = 240) -> str:
+    p = subprocess.run(["git", "-C", cwd, *args], capture_output=True, timeout=timeout_sec, env=ENV)
     if p.returncode:
         raise RuntimeError(p.stderr.decode("utf-8", "replace")[:300])
     return p.stdout.decode("utf-8", "replace")
 
 
-def fetch(cwd, sha, depth, tries=3):
+def fetch(cwd: str, sha: str, depth: int, tries: int = 3) -> str | None:
     """git fetch of one commit, with a few retries for network hiccups."""
     for i in range(tries):
         try:
-            return sh(cwd, "fetch", "-q", f"--depth={depth}", "origin", sha, timeout=300)
+            return sh(cwd, "fetch", "-q", f"--depth={depth}", "origin", sha, timeout_sec=300)
         except subprocess.TimeoutExpired:
             if i == tries - 1:
                 raise
@@ -92,15 +95,15 @@ def fetch(cwd, sha, depth, tries=3):
 
 
 # --------------------------------------------------------------------------- OSV -> fix commits
-def is_pypi(rec) -> bool:
+def is_pypi(rec: OsvRecord) -> bool:
     return any(str((a.get("package") or {}).get("ecosystem", "")).split(":")[0] == "PyPI"
                for a in rec.get("affected") or [])
 
 
-def extract_fixes(rec, strict=False, stats=None):
+def extract_fixes(rec: OsvRecord, strict: bool = False, stats: OsvStats | None = None) -> list[FixLink]:
     """-> [(repo 'owner/name' lowercase, commit sha lowercase, evidence)] found in one OSV record.
     `stats` (a Counter, optional) counts the INTRODUCED links that were ignored."""
-    out = []
+    out: list[FixLink] = []
     for a in rec.get("affected") or []:
         for rg in a.get("ranges") or []:
             if rg.get("type") == "GIT" and rg.get("repo"):
@@ -121,14 +124,14 @@ def extract_fixes(rec, strict=False, stats=None):
             if stats is not None:
                 stats["introduced_ref_skipped"] += 1
             continue
-        ev = "fix_ref" if ref.get("type") == "FIX" else "web_ref"
+        ev: Evidence = "fix_ref" if ref.get("type") == "FIX" else "web_ref"
         if strict and ev == "web_ref":
             continue
         out.append((m.group(1).lower(), m.group(2).lower(), ev))
     return out
 
 
-def repos_in(rec):
+def repos_in(rec: OsvRecord) -> set[str]:
     """lower-case owner/name of every GitHub repo mentioned in a record (reference links + GIT ranges)."""
     urls = [str(r.get("url", "")) for r in rec.get("references") or [] if isinstance(r, dict)]
     urls += [str(rg.get("repo", "")) for a in rec.get("affected") or [] for rg in a.get("ranges") or []
@@ -136,19 +139,21 @@ def repos_in(rec):
     return {m.group(1).lower() for u in urls for m in [_ANY_REPO.match(u.strip())] if m}
 
 
-def collect_fixes(osv_dir, strict=False, any_ecosystem=False, mal=None):
+def collect_fixes(osv_dir: str, strict: bool = False, any_ecosystem: bool = False,
+                  mal: MalStats | None = None) -> tuple[Fixes, OsvStats]:
     """Read every record -> ({repo: {sha: {"ids": set, "published": str, "evidence": set}}}, Counter).
     `mal` (optional dict) is filled with sets measured on the records themselves: "repos" (GitHub repos
     mentioned by MAL records), "commit_repos" (those with a commit link) and "other_repos" (repos
     mentioned by any non-MAL record)."""
-    fixes, st = {}, Counter()
+    fixes: Fixes = {}
+    st: OsvStats = Counter()
     for root, _, files in os.walk(osv_dir):
         for fn in sorted(files):
             if not fn.endswith(".json"):
                 continue
             try:
                 with open(os.path.join(root, fn), encoding="utf-8") as fh:
-                    rec = json.load(fh)
+                    rec: OsvRecord = json.load(fh)
             except (OSError, ValueError):
                 st["unreadable_files"] += 1
                 continue
@@ -208,10 +213,10 @@ def collect_fixes(osv_dir, strict=False, any_ecosystem=False, mal=None):
     return fixes, st
 
 
-def count_evidence(fixes):
+def count_evidence(fixes: Fixes) -> EvidenceCounts:
     """Count each fix commit once, by its strongest evidence: git_range, else fix_ref, else web_ref.
     The three counts never overlap and add up to the number of unique fix commits."""
-    counts = Counter()
+    counts: EvidenceCounts = Counter()
     for shas in fixes.values():
         for d in shas.values():
             if "git_range" in d["evidence"]:
@@ -223,12 +228,12 @@ def count_evidence(fixes):
     return counts
 
 
-def primary_id(ids):
+def primary_id(ids: set[str]) -> str:
     return sorted(ids, key=lambda i: (not i.startswith(("PYSEC", "GHSA")), i))[0]
 
 
 # --------------------------------------------------------------------------- one commit -> one record
-def record(cwd, sha, label, repo, info=None):
+def record(cwd: str, sha: str, label: int, repo: str, info: FixInfo | None = None) -> DatasetRow | None:
     """Extract one commit into a dict, or None if it is unusable (merge commit, no code files, ...)."""
     parents = sh(cwd, "rev-list", "--parents", "-n", "1", sha).split()[1:]
     if len(parents) != 1:
@@ -240,7 +245,8 @@ def record(cwd, sha, label, repo, info=None):
         return None
     msg = sh(cwd, "log", "-1", "--format=%B", sha)
     dates = sh(cwd, "log", "-1", "--format=%cI%n%aI", sha).split()
-    files = []
+    # the commit's code files that pass the filters, one FileChange each
+    files: list[FileChange] = []
     listing = sh(cwd, "-c", "core.quotepath=false", "diff-tree", "--no-commit-id", "--name-status", "-r", "-M", sha)
     for line in listing.splitlines():
         parts = line.split("\t")
@@ -262,7 +268,7 @@ def record(cwd, sha, label, repo, info=None):
     if not files:
         return None
     files.sort(key=lambda f: -abs(len(f["after"]) - len(f["before"])))
-    rec = {"repo": repo, "sha": sha, "label": label, "vuln": None, "message": msg, "files": files[:MAX_FILES],
+    rec: DatasetRow = {"repo": repo, "sha": sha, "label": label, "vuln": None, "message": msg, "files": files[:MAX_FILES],
            "commit_date": dates[0] if dates else None, "author_date": dates[1] if len(dates) > 1 else None}
     if info:
         rec.update({"vuln": primary_id(info["ids"]), "vulns": sorted(info["ids"]),
@@ -271,14 +277,22 @@ def record(cwd, sha, label, repo, info=None):
 
 
 # --------------------------------------------------------------------------- one repo
-def work_repo(repo, shas, neg_per_pos, out_path, done_path, depth):
+def work_repo(repo: str, shas: RepoFixes, neg_per_pos: int, out_path: str, done_path: str,
+              depth: int) -> RepoResult:
     """Fetch one repo's fix commits (label 1) + random earlier commits (label 0); append to out_path."""
     tmp = tempfile.mkdtemp(prefix="osv_ds_")
-    got = Counter()
+    got: RepoStats = Counter()
     try:
         sh(tmp, "init", "-q")
         sh(tmp, "remote", "add", "origin", f"https://github.com/{repo}")
-        recs, negs, pos_full, have_history = [], [], set(), False
+        # rows for the fix commits (label 1)
+        recs: list[DatasetRow] = []
+        # rows for the ordinary commits (label 0)
+        negs: list[DatasetRow] = []
+        # full sha of every fix seen so far
+        pos_full: set[str] = set()
+        # True once the deep fetch (with history) is done
+        have_history = False
         for sha, info in shas.items():
             try:
                 # only the first fix is fetched with real history; every later "fetch --depth" re-cuts the
@@ -306,10 +320,12 @@ def work_repo(repo, shas, neg_per_pos, out_path, done_path, depth):
             if not have_history:
                 have_history = True
                 # ordinary commits: random earlier commits from the history before this (first) fix
+                # shas of the commits before the first fix, newest first (before shuffling)
+                hist: list[str] = []
                 try:
                     hist = sh(tmp, "rev-list", "--no-merges", "-n", str(depth), full + "^").split()
                 except Exception:
-                    hist = []
+                    pass
                 random.Random(full).shuffle(hist)
                 want = neg_per_pos * len(shas)
                 for h in hist:
@@ -337,7 +353,7 @@ def work_repo(repo, shas, neg_per_pos, out_path, done_path, depth):
 
 
 # --------------------------------------------------------------------------- main
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--osv-dir", required=True, help="folder with OSV *.json records (download_osv.py output)")
     ap.add_argument("--out", default="dataset_osv.jsonl")
@@ -358,7 +374,7 @@ def main():
 
     if not os.path.isdir(a.osv_dir):
         sys.exit(f"{a.osv_dir} is not a folder - run download_osv.py first")
-    mal = {"repos": set(), "commit_repos": set(), "other_repos": set()}
+    mal: MalStats = {"repos": set(), "commit_repos": set(), "other_repos": set()}
     fixes, st = collect_fixes(a.osv_dir, a.strict, a.any_ecosystem, mal)
     if not fixes:
         sys.exit("no fix commits found in the OSV records (check --osv-dir)")
@@ -388,24 +404,29 @@ def main():
 
     skip = {s.strip().lower() for s in a.skip.split(",") if s.strip()}
     # Goes over keys by default
-    repos = sorted(r for r in fixes if r not in skip)
+    repos: list[str] = sorted(r for r in fixes if r not in skip)
     random.Random(a.seed).shuffle(repos)
     repos = repos[a.offset:(a.offset + a.max_repos) if a.max_repos else None]
     done_path = a.out + ".done"
-    done = set()
+    done: set[str] = set()
     if os.path.exists(done_path):
         with open(done_path, encoding="utf-8") as fh:
             done = {l.strip() for l in fh if l.strip()}
-    todo = [r for r in repos if r not in done]
+    todo: list[str] = [r for r in repos if r not in done]
     print(f"processing {len(todo)} repos (already done: {len(repos) - len(todo)}) with {a.threads} threads "
           f"-> {a.out}", flush=True)
 
-    total, n = Counter(), 0
+    # every repo's RepoStats added up, plus "repo_crashed"
+    total: RepoStats = Counter()
+    # how many repos have finished so far (the n in "[n/len(todo)]")
+    n = 0
     ex = ThreadPoolExecutor(a.threads)
     try:
-        futs = {}
+        # Future -> repo name
+        futs: dict[Future[RepoResult], str] = {}
         for r in todo:
-            order = sorted(fixes[r].items(), key=lambda kv: (kv[1]["published"] or "9999", kv[0]))
+            order: list[tuple[str, FixInfo]] = sorted(
+                fixes[r].items(), key=lambda kv: (kv[1]["published"] or "9999", kv[0]))
             futs[ex.submit(work_repo, r, dict(order[:a.max_pos_per_repo]), a.neg_per_pos, a.out, done_path,
                            a.depth)] = r
         for f in as_completed(futs):
